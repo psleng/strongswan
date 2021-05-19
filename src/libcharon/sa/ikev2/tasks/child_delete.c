@@ -183,6 +183,7 @@ static status_t destroy_and_reestablish_internal(ike_sa_t *ike_sa,
 	{
 		args.label = args.label->clone(args.label);
 	}
+	args.cpu = child_sa->get_cpu(child_sa);
 	action = forced_action ?: child_sa->get_close_action(child_sa);
 
 	DBG1(DBG_IKE, "CHILD_SA %s{%u} closed", child_sa->get_name(child_sa),
