@@ -977,6 +977,10 @@ static status_t install_internal(private_child_sa_t *this, chunk_t encr,
 			src->set_port(src, 0);
 			this->encap = TRUE;
 		}
+		if (this->per_cpu)
+		{
+			cpu = this->cpu;
+		}
 	}
 	else
 	{
