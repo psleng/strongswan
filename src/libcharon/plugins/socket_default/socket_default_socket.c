@@ -650,10 +650,10 @@ METHOD(socket_t, supported_families, socket_family_t,
 }
 
 /**
- * open a socket to send and receive packets
+ * Open a socket to send and receive packets
  */
-static int open_socket(private_socket_default_socket_t *this,
-					   int family, uint16_t *port)
+static status_t open_socket(private_socket_default_socket_t *this,
+							int family, uint16_t *port, int *skt_out)
 {
 	int on = TRUE;
 	union {
@@ -689,14 +689,14 @@ static int open_socket(private_socket_default_socket_t *this,
 			pktinfo = IPV6_RECVPKTINFO;
 			break;
 		default:
-			return -1;
+			return FAILED;
 	}
 
 	skt = socket(family, SOCK_DGRAM, IPPROTO_UDP);
 	if (skt < 0)
 	{
 		DBG1(DBG_NET, "could not open socket: %s", strerror(errno));
-		return -1;
+		return NOT_SUPPORTED;
 	}
 
 	if (family == AF_INET6 &&
@@ -704,15 +704,17 @@ static int open_socket(private_socket_default_socket_t *this,
 	{
 		DBG1(DBG_NET, "unable to set IPV6_V6ONLY on socket: %s", strerror(errno));
 		close(skt);
-		return -1;
+		return FAILED;
 	}
 
 	/* bind the socket */
 	if (bind(skt, &addr.sockaddr, addrlen) < 0)
 	{
+		status_t status = (errno == EADDRINUSE) ? ALREADY_DONE : FAILED;
+
 		DBG1(DBG_NET, "unable to bind socket: %s", strerror(errno));
 		close(skt);
-		return -1;
+		return status;
 	}
 
 	/* retrieve randomly allocated port if needed */
@@ -722,7 +724,7 @@ static int open_socket(private_socket_default_socket_t *this,
 		{
 			DBG1(DBG_NET, "unable to determine port: %s", strerror(errno));
 			close(skt);
-			return -1;
+			return FAILED;
 		}
 		switch (family)
 		{
@@ -742,7 +744,7 @@ static int open_socket(private_socket_default_socket_t *this,
 		{
 			DBG1(DBG_NET, "unable to set IP_PKTINFO on socket: %s", strerror(errno));
 			close(skt);
-			return -1;
+			return FAILED;
 		}
 	}
 #ifdef SO_MARK
@@ -778,7 +780,8 @@ static int open_socket(private_socket_default_socket_t *this,
 			 family == AF_INET ? "IPv4" : "IPv6", this->natt);
 	}
 
-	return skt;
+	*skt_out = skt;
+	return SUCCESS;
 }
 
 /**
@@ -800,31 +803,80 @@ static bool use_family(int family)
 }
 
 /**
- * Open a socket pair (normal and NAT traversal) for a given address family
+ * Open a single socket of the given family on the given port.
  */
-static void open_socketpair(private_socket_default_socket_t *this, int family,
-							int *skt, int *skt_natt, char *label)
+static status_t open_socket_family(private_socket_default_socket_t *this,
+								   int family, uint16_t *port, int *skt)
 {
+	const char *label = family == AF_INET ? "IPv4" : "IPv6";
+	const char *socket_type = port == &this->natt ? " NAT-T" : "";
+	status_t status;
+
 	if (!use_family(family))
 	{
-		*skt = -1;
-		*skt_natt = -1;
-		return;
+		DBG1(DBG_NET, "not opening %s%s socket, disabled in config", label,
+			 socket_type);
+		return NOT_SUPPORTED;
 	}
 
-	*skt = open_socket(this, family, &this->port);
-	if (*skt == -1)
+	status = open_socket(this, family, port, skt);
+	switch (status)
 	{
-		*skt_natt = -1;
-		DBG1(DBG_NET, "could not open %s socket, %s disabled", label, label);
+		case NOT_SUPPORTED:
+		case FAILED:
+			DBG1(DBG_NET, "could not open %s%s socket on port %hu", label,
+				 socket_type, *port);
+			break;
+		case ALREADY_DONE:
+			DBG1(DBG_NET, "could not open %s%s socket on port %hu due to "
+				 "conflict", label, socket_type, *port);
+			break;
+		default:
+			break;
 	}
-	else
+	return status;
+}
+
+/**
+ * Open a pair of sockets on the same port for both address families.
+ */
+static void open_socketpair(private_socket_default_socket_t *this,
+							uint16_t *port, int *skt_v4, int *skt_v6)
+{
+	uint16_t configured_port = *port;
+	bool retry_if_used = TRUE;
+
+	while (TRUE)
 	{
-		*skt_natt = open_socket(this, family, &this->natt);
-		if (*skt_natt == -1)
+		*skt_v4 = -1;
+		*skt_v6 = -1;
+
+		switch (open_socket_family(this, AF_INET, port, skt_v4))
 		{
-			DBG1(DBG_NET, "could not open %s NAT-T socket", label);
+			case ALREADY_DONE:
+				/* requested port could not be bound (or no ephemeral ports
+				 * available), don't even try with IPv6 */
+				return;
+			case FAILED:
+			case NOT_SUPPORTED:
+				/* no point in retrying as any conflict for IPv6 is not caused
+				 * by our IPv4 socket */
+				retry_if_used = FALSE;
+				break;
+			default:
+				break;
 		}
+
+		if (open_socket_family(this, AF_INET6, port, skt_v6) == ALREADY_DONE &&
+			retry_if_used && !configured_port)
+		{
+			/* when using an ephemeral port, retry allocating a different one in
+			 * case of a conflict */
+			*port = configured_port;
+			close(*skt_v4);
+			continue;
+		}
+		break;
 	}
 }
 
@@ -900,16 +952,8 @@ socket_default_socket_t *socket_default_socket_create()
 		}
 	}
 
-	/* we allocate IPv6 sockets first as that will reserve randomly allocated
-	 * ports also for IPv4. On OS X, we have to do it the other way round
-	 * for the same effect. */
-#ifdef __APPLE__
-	open_socketpair(this, AF_INET, &this->ipv4, &this->ipv4_natt, "IPv4");
-	open_socketpair(this, AF_INET6, &this->ipv6, &this->ipv6_natt, "IPv6");
-#else /* !__APPLE__ */
-	open_socketpair(this, AF_INET6, &this->ipv6, &this->ipv6_natt, "IPv6");
-	open_socketpair(this, AF_INET, &this->ipv4, &this->ipv4_natt, "IPv4");
-#endif /* __APPLE__ */
+	open_socketpair(this, &this->port, &this->ipv4,      &this->ipv6);
+	open_socketpair(this, &this->natt, &this->ipv4_natt, &this->ipv6_natt);
 
 	if (this->ipv4 == -1 && this->ipv6 == -1)
 	{
@@ -917,6 +961,5 @@ socket_default_socket_t *socket_default_socket_create()
 		destroy(this);
 		return NULL;
 	}
-
 	return &this->public;
 }
